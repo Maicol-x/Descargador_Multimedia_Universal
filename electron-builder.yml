@@ -1,0 +1,30 @@
+appId: com.universal.downloader
+productName: Universal Media Downloader
+directories:
+  output: dist-electron
+files:
+  - "dist/**"
+  - "electron/**"
+  - "server/**"
+  - "package.json"
+extraResources:
+  - from: "binaries"
+    to: "binaries"
+    filter:
+      - "**/*"
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+    - target: nsis
+      arch:
+        - x64
+  artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+portable:
+  artifactName: "${productName}-Portable.exe"
