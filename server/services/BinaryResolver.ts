@@ -8,15 +8,20 @@ export class BinaryResolver {
   private static cachedFfprobe: string | null = null;
 
   /**
-   * Determine the root directory whether running in development,
-   * standalone node, or packaged Electron.
+   * Get user runtime directory for updated binaries
    */
-  public static getAppRoot(): string {
-    return process.cwd();
+  public static getUserRuntimeDir(): string {
+    if (process.env.APPDATA) {
+      return path.join(process.env.APPDATA, 'UniversalMediaDownloader', 'runtime');
+    }
+    if (process.env.HOME) {
+      return path.join(process.env.HOME, '.universal_media_downloader', 'runtime');
+    }
+    return path.join(process.cwd(), 'runtime');
   }
 
   /**
-   * Resolve yt-dlp binary path
+   * Resolve yt-dlp binary path with robust multi-tier fallback
    */
   public static resolveYtDlp(): string {
     if (this.cachedYtDlp && fs.existsSync(this.cachedYtDlp)) {
@@ -25,50 +30,75 @@ export class BinaryResolver {
 
     const isWindows = process.platform === 'win32';
     const binaryName = isWindows ? 'yt-dlp.exe' : 'yt-dlp';
-    const appRoot = this.getAppRoot();
 
-    // Potential locations in order of priority:
-    const candidates: string[] = [
-      // 1. Electron resourcesPath (packaged app)
-      ...(process.env.RESOURCES_PATH
-        ? [
-            path.join(process.env.RESOURCES_PATH, 'binaries', binaryName),
-            path.join(process.env.RESOURCES_PATH, 'binaries', 'yt-dlp', binaryName),
-          ]
-        : []),
-      // 2. Project local binaries folder
-      path.join(appRoot, 'binaries', binaryName),
-      path.join(appRoot, 'binaries', 'yt-dlp', binaryName),
-      path.join(appRoot, 'binaries', 'yt-dlp'),
-      // 3. Fallbacks
-      path.join('/usr/local/bin', binaryName),
-      path.join('/usr/bin', binaryName),
-      path.join('/tmp', binaryName),
-    ];
-
-    for (const candidate of candidates) {
+    // 1. Updated runtime binary in UserData (highest priority if valid)
+    const userRuntimePath = path.join(this.getUserRuntimeDir(), binaryName);
+    if (fs.existsSync(userRuntimePath)) {
       try {
-        if (fs.existsSync(candidate)) {
-          // ensure executable permission on unix
+        const stat = fs.statSync(userRuntimePath);
+        if (stat.size > 500000) {
           if (!isWindows) {
             try {
-              fs.chmodSync(candidate, 0o755);
+              fs.chmodSync(userRuntimePath, 0o755);
             } catch {
               // ignore
             }
           }
-          this.cachedYtDlp = candidate;
-          return candidate;
+          this.cachedYtDlp = userRuntimePath;
+          return userRuntimePath;
         }
       } catch {
-        // continue
+        // continue to next tier
       }
     }
 
-    // 4. Check system PATH
+    // 2. Electron resourcesPath (packaged app)
+    const resourcesPath =
+      process.env.RESOURCES_PATH ||
+      (typeof process !== 'undefined' && (process as any).resourcesPath);
+
+    if (resourcesPath) {
+      const candidatesInResources = [
+        path.join(resourcesPath, 'binaries', binaryName),
+        path.join(resourcesPath, 'binaries', 'yt-dlp', binaryName),
+      ];
+      for (const candidate of candidatesInResources) {
+        if (fs.existsSync(candidate)) {
+          this.cachedYtDlp = candidate;
+          return candidate;
+        }
+      }
+    }
+
+    // 3. Project local binaries folder (relative to module or cwd)
+    const projectCandidates = [
+      path.join(process.cwd(), 'binaries', binaryName),
+      path.join(__dirname, '..', '..', 'binaries', binaryName),
+      path.join(__dirname, '..', '..', '..', 'binaries', binaryName),
+      path.join(process.cwd(), 'binaries', 'yt-dlp'),
+    ];
+
+    for (const candidate of projectCandidates) {
+      if (fs.existsSync(candidate)) {
+        if (!isWindows) {
+          try {
+            fs.chmodSync(candidate, 0o755);
+          } catch {
+            // ignore
+          }
+        }
+        this.cachedYtDlp = candidate;
+        return candidate;
+      }
+    }
+
+    // 4. System PATH fallback
     try {
       const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0].trim();
+      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
+        .trim()
+        .split(/\r?\n/)[0]
+        .trim();
       if (pathOutput && fs.existsSync(pathOutput)) {
         this.cachedYtDlp = pathOutput;
         return pathOutput;
@@ -77,7 +107,21 @@ export class BinaryResolver {
       // not in PATH
     }
 
-    // Default fallback to bare binary name
+    // 5. Unix standard system locations
+    if (!isWindows) {
+      const unixPaths = [
+        '/usr/local/bin/yt-dlp',
+        '/usr/bin/yt-dlp',
+        path.join(process.env.HOME || '', '.local', 'bin', 'yt-dlp'),
+      ];
+      for (const up of unixPaths) {
+        if (fs.existsSync(up)) {
+          this.cachedYtDlp = up;
+          return up;
+        }
+      }
+    }
+
     return binaryName;
   }
 
@@ -91,19 +135,25 @@ export class BinaryResolver {
 
     const isWindows = process.platform === 'win32';
     const binaryName = isWindows ? 'ffmpeg.exe' : 'ffmpeg';
-    const appRoot = this.getAppRoot();
 
-    const candidates: string[] = [
-      ...(process.env.RESOURCES_PATH
-        ? [
-            path.join(process.env.RESOURCES_PATH, 'binaries', binaryName),
-            path.join(process.env.RESOURCES_PATH, 'binaries', 'ffmpeg', binaryName),
-          ]
-        : []),
-      path.join(appRoot, 'binaries', binaryName),
-      path.join(appRoot, 'binaries', 'ffmpeg', binaryName),
-      path.join('/usr/bin', binaryName),
-      path.join('/usr/local/bin', binaryName),
+    // 1. Packaged Electron resources
+    const resourcesPath =
+      process.env.RESOURCES_PATH ||
+      (typeof process !== 'undefined' && (process as any).resourcesPath);
+
+    if (resourcesPath) {
+      const candidate = path.join(resourcesPath, 'binaries', binaryName);
+      if (fs.existsSync(candidate)) {
+        this.cachedFfmpeg = candidate;
+        return candidate;
+      }
+    }
+
+    // 2. Development & local binaries
+    const candidates = [
+      path.join(process.cwd(), 'binaries', binaryName),
+      path.join(__dirname, '..', '..', 'binaries', binaryName),
+      path.join(__dirname, '..', '..', '..', 'binaries', binaryName),
     ];
 
     for (const candidate of candidates) {
@@ -113,15 +163,29 @@ export class BinaryResolver {
       }
     }
 
+    // 3. System PATH
     try {
       const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0].trim();
+      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
+        .trim()
+        .split(/\r?\n/)[0]
+        .trim();
       if (pathOutput && fs.existsSync(pathOutput)) {
         this.cachedFfmpeg = pathOutput;
         return pathOutput;
       }
     } catch {
-      // ignore
+      // not in PATH
+    }
+
+    // 4. Standard system locations
+    if (!isWindows) {
+      for (const p of ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
+        if (fs.existsSync(p)) {
+          this.cachedFfmpeg = p;
+          return p;
+        }
+      }
     }
 
     return binaryName;
@@ -137,19 +201,25 @@ export class BinaryResolver {
 
     const isWindows = process.platform === 'win32';
     const binaryName = isWindows ? 'ffprobe.exe' : 'ffprobe';
-    const appRoot = this.getAppRoot();
 
-    const candidates: string[] = [
-      ...(process.env.RESOURCES_PATH
-        ? [
-            path.join(process.env.RESOURCES_PATH, 'binaries', binaryName),
-            path.join(process.env.RESOURCES_PATH, 'binaries', 'ffmpeg', binaryName),
-          ]
-        : []),
-      path.join(appRoot, 'binaries', binaryName),
-      path.join(appRoot, 'binaries', 'ffmpeg', binaryName),
-      path.join('/usr/bin', binaryName),
-      path.join('/usr/local/bin', binaryName),
+    // 1. Packaged Electron resources
+    const resourcesPath =
+      process.env.RESOURCES_PATH ||
+      (typeof process !== 'undefined' && (process as any).resourcesPath);
+
+    if (resourcesPath) {
+      const candidate = path.join(resourcesPath, 'binaries', binaryName);
+      if (fs.existsSync(candidate)) {
+        this.cachedFfprobe = candidate;
+        return candidate;
+      }
+    }
+
+    // 2. Development & local binaries
+    const candidates = [
+      path.join(process.cwd(), 'binaries', binaryName),
+      path.join(__dirname, '..', '..', 'binaries', binaryName),
+      path.join(__dirname, '..', '..', '..', 'binaries', binaryName),
     ];
 
     for (const candidate of candidates) {
@@ -159,23 +229,34 @@ export class BinaryResolver {
       }
     }
 
+    // 3. System PATH
     try {
       const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0].trim();
+      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
+        .trim()
+        .split(/\r?\n/)[0]
+        .trim();
       if (pathOutput && fs.existsSync(pathOutput)) {
         this.cachedFfprobe = pathOutput;
         return pathOutput;
       }
     } catch {
-      // ignore
+      // not in PATH
+    }
+
+    // 4. Standard system locations
+    if (!isWindows) {
+      for (const p of ['/usr/bin/ffprobe', '/usr/local/bin/ffprobe']) {
+        if (fs.existsSync(p)) {
+          this.cachedFfprobe = p;
+          return p;
+        }
+      }
     }
 
     return binaryName;
   }
 
-  /**
-   * Clear cache (useful after updater runs)
-   */
   public static clearCache(): void {
     this.cachedYtDlp = null;
     this.cachedFfmpeg = null;

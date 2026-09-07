@@ -7,15 +7,58 @@ export class QueueManager {
   private static instance: QueueManager;
   private tasks: Map<string, DownloadTask> = new Map();
   private sseClients: Set<Response> = new Set();
-  private activeWorkers = 0;
+  private runningTaskIds: Set<string> = new Set();
+  private pingInterval: NodeJS.Timeout | null = null;
 
-  private constructor() {}
+  private constructor() {
+    this.recoverTasks();
+    this.startHeartbeat();
+  }
 
   public static getInstance(): QueueManager {
     if (!QueueManager.instance) {
       QueueManager.instance = new QueueManager();
     }
     return QueueManager.instance;
+  }
+
+  /**
+   * Recovers tasks from SQLite database on application startup.
+   * Interrupted tasks are marked as PAUSED so users can resume them.
+   */
+  private recoverTasks(): void {
+    try {
+      const saved = appDb.getSavedTasks();
+      for (const task of saved) {
+        if (task.status === 'DOWNLOADING' || task.status === 'PROCESSING') {
+          // Process was killed when the app closed; mark as PAUSED
+          task.status = 'PAUSED';
+          task.speed = 'Interrumpido (Listo para reanudar)';
+          task.eta = '--:--';
+          appDb.saveTask(task);
+        }
+        this.tasks.set(task.id, task);
+      }
+      console.log(`[QueueManager] Recuperadas ${this.tasks.size} tareas desde SQLite.`);
+    } catch (err) {
+      console.error('[QueueManager] Error al recuperar tareas:', err);
+    }
+  }
+
+  private startHeartbeat(): void {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    this.pingInterval = setInterval(() => {
+      for (const client of this.sseClients) {
+        try {
+          client.write(': ping\n\n');
+        } catch {
+          this.sseClients.delete(client);
+        }
+      }
+    }, 15000);
+    if (this.pingInterval.unref) {
+      this.pingInterval.unref();
+    }
   }
 
   public registerSseClient(res: Response): void {
@@ -33,6 +76,7 @@ export class QueueManager {
   }
 
   private broadcastTaskUpdate(task: DownloadTask): void {
+    appDb.saveTask(task);
     const payload = JSON.stringify({
       type: 'TASK_UPDATED',
       task,
@@ -47,6 +91,7 @@ export class QueueManager {
   }
 
   private broadcastTaskRemoved(taskId: string): void {
+    appDb.deleteTask(taskId);
     const payload = JSON.stringify({
       type: 'TASK_REMOVED',
       taskId,
@@ -60,6 +105,26 @@ export class QueueManager {
     }
   }
 
+  // --- WORKER CONCURRENCY GUARDS ---
+  private acquireWorker(taskId: string): boolean {
+    const settings = appDb.getSettings();
+    const maxConcurrency = Math.max(1, Math.min(5, settings.maxConcurrency || 3));
+    if (this.runningTaskIds.size >= maxConcurrency) {
+      return false;
+    }
+    this.runningTaskIds.add(taskId);
+    return true;
+  }
+
+  private releaseWorker(taskId: string): void {
+    this.runningTaskIds.delete(taskId);
+  }
+
+  public getActiveWorkerCount(): number {
+    return this.runningTaskIds.size;
+  }
+
+  // --- QUEUE ACTIONS ---
   public getAllTasks(): DownloadTask[] {
     return Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
   }
@@ -90,7 +155,7 @@ export class QueueManager {
 
     if (task.status === 'DOWNLOADING' || task.status === 'PROCESSING') {
       YtDlpService.cancelDownload(id);
-      this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+      this.releaseWorker(id);
       task.status = 'PAUSED';
       task.speed = 'Pausado';
       this.broadcastTaskUpdate(task);
@@ -117,15 +182,13 @@ export class QueueManager {
 
     if (task.status === 'DOWNLOADING' || task.status === 'PROCESSING') {
       YtDlpService.cancelDownload(id);
-      this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+      this.releaseWorker(id);
     }
 
     task.status = 'CANCELLED';
     task.speed = 'Cancelado';
     task.eta = '--:--';
     this.broadcastTaskUpdate(task);
-
-    // Save to history
     this.saveToHistory(task);
     this.processNextInQueue();
     return true;
@@ -151,7 +214,7 @@ export class QueueManager {
 
     if (task.status === 'DOWNLOADING' || task.status === 'PROCESSING') {
       YtDlpService.cancelDownload(id);
-      this.activeWorkers = Math.max(0, this.activeWorkers - 1);
+      this.releaseWorker(id);
     }
 
     this.tasks.delete(id);
@@ -167,13 +230,14 @@ export class QueueManager {
         this.broadcastTaskRemoved(id);
       }
     }
+    appDb.clearCompletedTasks();
   }
 
-  private processNextInQueue(): void {
+  public processNextInQueue(): void {
     const settings = appDb.getSettings();
     const maxConcurrency = Math.max(1, Math.min(5, settings.maxConcurrency || 3));
 
-    if (this.activeWorkers >= maxConcurrency) {
+    if (this.runningTaskIds.size >= maxConcurrency) {
       return;
     }
 
@@ -184,7 +248,10 @@ export class QueueManager {
 
     if (!nextTask) return;
 
-    this.activeWorkers++;
+    if (!this.acquireWorker(nextTask.id)) {
+      return;
+    }
+
     nextTask.status = 'DOWNLOADING';
     nextTask.speed = 'Iniciando descarga...';
     this.broadcastTaskUpdate(nextTask);
@@ -192,22 +259,27 @@ export class QueueManager {
     YtDlpService.startDownload(
       nextTask,
       (progressUpdates) => {
+        // Guard against stale callbacks if task was already paused/cancelled
+        if (nextTask.status === 'PAUSED' || nextTask.status === 'CANCELLED') return;
         Object.assign(nextTask, progressUpdates);
         this.broadcastTaskUpdate(nextTask);
       },
       (completionUpdates) => {
+        this.releaseWorker(nextTask.id);
         Object.assign(nextTask, completionUpdates);
-        this.activeWorkers = Math.max(0, this.activeWorkers - 1);
         this.broadcastTaskUpdate(nextTask);
         this.saveToHistory(nextTask);
         this.processNextInQueue();
       },
       (errorMessage) => {
+        this.releaseWorker(nextTask.id);
+        if (nextTask.status === 'PAUSED' || nextTask.status === 'CANCELLED') {
+          return;
+        }
         nextTask.status = 'FAILED';
         nextTask.error = errorMessage;
         nextTask.speed = 'Error';
         nextTask.eta = '--:--';
-        this.activeWorkers = Math.max(0, this.activeWorkers - 1);
         this.broadcastTaskUpdate(nextTask);
         this.saveToHistory(nextTask);
         this.processNextInQueue();

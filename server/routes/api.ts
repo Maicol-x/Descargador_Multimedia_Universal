@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import { YtDlpService } from '../services/YtDlpService.ts';
 import { FfmpegService } from '../services/FfmpegService.ts';
 import { BinaryResolver } from '../services/BinaryResolver.ts';
@@ -16,12 +16,17 @@ export const apiRouter = express.Router();
 // 1. ANALYZE URL
 apiRouter.post('/analyze', async (req: Request, res: Response) => {
   const { url } = req.body;
-  if (!url || typeof url !== 'string') {
+  if (!url || typeof url !== 'string' || !url.trim()) {
     return res.status(400).json({ error: 'Debes proporcionar una URL válida.' });
   }
 
+  const cleanUrl = url.trim();
+  if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+    return res.status(400).json({ error: 'La URL debe comenzar con http:// o https://' });
+  }
+
   try {
-    const mediaInfo = await YtDlpService.analyzeUrl(url);
+    const mediaInfo = await YtDlpService.analyzeUrl(cleanUrl);
     return res.json(mediaInfo);
   } catch (err: any) {
     return res.status(422).json({ error: err.message || 'Error al analizar la URL' });
@@ -39,18 +44,23 @@ apiRouter.post('/download', (req: Request, res: Response) => {
   const createdTasks: DownloadTask[] = [];
 
   for (const item of items) {
-    const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-    const downloadDir = item.downloadDir || settings.downloadDir || path.join(os.homedir(), 'Downloads');
+    if (!item.url || typeof item.url !== 'string') continue;
+
+    const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const downloadDir =
+      (typeof item.downloadDir === 'string' && item.downloadDir.trim()) ||
+      settings.downloadDir ||
+      path.join(os.homedir(), 'Downloads');
 
     const task: DownloadTask = {
       id: taskId,
-      url: item.url,
-      title: item.title || 'Descarga Multimedia',
+      url: item.url.trim(),
+      title: (item.title || 'Descarga Multimedia').trim(),
       uploader: item.uploader,
       thumbnail: item.thumbnail,
-      mode: item.mode || 'video',
-      format: item.format || (item.mode === 'audio' ? 'mp3' : 'mp4'),
-      quality: item.quality || (item.mode === 'audio' ? '320 kbps' : '1080p'),
+      mode: item.mode === 'audio' ? 'audio' : 'video',
+      format: (item.format || (item.mode === 'audio' ? 'mp3' : 'mp4')).toLowerCase(),
+      quality: item.quality || (item.mode === 'audio' ? '320 kbps (Máxima)' : '1080p (Full HD)'),
       downloadDir,
       status: 'QUEUED',
       progress: 0,
@@ -66,6 +76,10 @@ apiRouter.post('/download', (req: Request, res: Response) => {
     createdTasks.push(task);
   }
 
+  if (createdTasks.length === 0) {
+    return res.status(400).json({ error: 'Ningún elemento válido para procesar.' });
+  }
+
   queueManager.addMultipleTasks(createdTasks);
   return res.json({ success: true, count: createdTasks.length, tasks: createdTasks });
 });
@@ -78,8 +92,9 @@ apiRouter.get('/downloads', (_req: Request, res: Response) => {
 // 4. SSE REAL-TIME PROGRESS
 apiRouter.get('/downloads/events', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
   queueManager.registerSseClient(res);
@@ -137,8 +152,11 @@ apiRouter.get('/settings', (_req: Request, res: Response) => {
 });
 
 apiRouter.post('/settings', (req: Request, res: Response) => {
-  const updated = appDb.saveSettings(req.body);
-  res.json(updated);
+  if (req.body && typeof req.body === 'object') {
+    const updated = appDb.saveSettings(req.body);
+    return res.json(updated);
+  }
+  res.status(400).json({ error: 'Configuración inválida' });
 });
 
 // 8. DIAGNOSTICS
@@ -148,7 +166,6 @@ apiRouter.get('/diagnostics', async (_req: Request, res: Response) => {
   const ffmpegInfo = await FfmpegService.getFfmpegInfo();
   const ffprobeInfo = await FfmpegService.getFfprobeInfo();
 
-  // Test download dir writability
   let dirOk = false;
   let dirError: string | undefined;
   try {
@@ -167,12 +184,12 @@ apiRouter.get('/diagnostics', async (_req: Request, res: Response) => {
   const result: DiagnosticResult = {
     app: {
       ok: true,
-      message: 'Universal Media Downloader Online',
+      message: 'Universal Media Downloader Operativo',
       version: '1.0.0 (Production Core)',
     },
     database: {
       ok: true,
-      message: 'SQLite WAL Operativo',
+      message: 'SQLite WAL Operativo (Persistencia Activa)',
       path: appDb.getDbPath(),
     },
     ytdlp: {
@@ -200,7 +217,7 @@ apiRouter.get('/diagnostics', async (_req: Request, res: Response) => {
       error: dirError,
     },
     environment: {
-      isElectron: Boolean(process.versions.electron),
+      isElectron: Boolean(process.env.IS_ELECTRON || (process.versions as any)?.electron),
       platform: process.platform,
       arch: process.arch,
       nodeVersion: process.version,
@@ -216,49 +233,55 @@ apiRouter.post('/ytdlp/update', async (_req: Request, res: Response) => {
   res.json(result);
 });
 
-// 10. SYSTEM OPEN FILE / FOLDER
+// 10. SAFE OPEN FILE / FOLDER (Without command injection)
 apiRouter.post('/open-file', (req: Request, res: Response) => {
   const { filePath } = req.body;
-  if (!filePath || !fs.existsSync(filePath)) {
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'Ruta no válida.' });
+  }
+
+  const safePath = path.normalize(filePath);
+  if (!fs.existsSync(safePath)) {
     return res.status(404).json({ error: 'El archivo especificado no existe.' });
   }
 
   const isWindows = process.platform === 'win32';
   const isMac = process.platform === 'darwin';
-  const cmd = isWindows
-    ? `explorer /select,"${filePath}"`
-    : isMac
-    ? `open -R "${filePath}"`
-    : `xdg-open "${path.dirname(filePath)}"`;
 
-  exec(cmd, (err) => {
-    if (err) {
-      return res.status(500).json({ error: 'No se pudo abrir el archivo.' });
-    }
-    res.json({ success: true });
-  });
+  if (isWindows) {
+    spawn('explorer.exe', ['/select,', safePath], { detached: true });
+  } else if (isMac) {
+    spawn('open', ['-R', safePath], { detached: true });
+  } else {
+    spawn('xdg-open', [path.dirname(safePath)], { detached: true });
+  }
+
+  return res.json({ success: true });
 });
 
 apiRouter.post('/open-folder', (req: Request, res: Response) => {
   const { folderPath } = req.body;
-  const target = folderPath || appDb.getSettings().downloadDir;
+  const target = (typeof folderPath === 'string' && folderPath.trim()) || appDb.getSettings().downloadDir;
 
-  if (!target || !fs.existsSync(target)) {
+  if (!target) {
+    return res.status(400).json({ error: 'Carpeta no especificada.' });
+  }
+
+  const safePath = path.normalize(target);
+  if (!fs.existsSync(safePath)) {
     return res.status(404).json({ error: 'La carpeta no existe.' });
   }
 
   const isWindows = process.platform === 'win32';
   const isMac = process.platform === 'darwin';
-  const cmd = isWindows
-    ? `explorer "${target}"`
-    : isMac
-    ? `open "${target}"`
-    : `xdg-open "${target}"`;
 
-  exec(cmd, (err) => {
-    if (err) {
-      return res.status(500).json({ error: 'No se pudo abrir la carpeta.' });
-    }
-    res.json({ success: true });
-  });
+  if (isWindows) {
+    spawn('explorer.exe', [safePath], { detached: true });
+  } else if (isMac) {
+    spawn('open', [safePath], { detached: true });
+  } else {
+    spawn('xdg-open', [safePath], { detached: true });
+  }
+
+  return res.json({ success: true });
 });

@@ -1,17 +1,19 @@
-appId: com.universal.downloader
+appId: com.universalmediadownloader.app
 productName: Universal Media Downloader
 directories:
   output: dist-electron
+npmRebuild: true
 files:
   - "dist/**"
   - "electron/**"
-  - "server/**"
   - "package.json"
 extraResources:
   - from: "binaries"
     to: "binaries"
     filter:
-      - "**/*"
+      - "yt-dlp.exe"
+      - "ffmpeg.exe"
+      - "ffprobe.exe"
 win:
   target:
     - target: portable

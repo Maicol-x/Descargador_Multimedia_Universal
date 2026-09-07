@@ -1,35 +1,78 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, Notification } = require('electron');
 const path = require('path');
 const http = require('http');
+const fs = require('fs');
 
 let mainWindow = null;
 let serverInstance = null;
 let serverPort = 3000;
 
+// Propagate Electron resources path to Node environment
+process.env.IS_ELECTRON = 'true';
+if (process.resourcesPath) {
+  process.env.RESOURCES_PATH = process.resourcesPath;
+}
+
 async function startInternalServer() {
   try {
-    // Dynamically require the express app
-    const { expressApp } = await import('../server/app.ts');
-    return new Promise((resolve) => {
+    let expressApp = null;
+
+    // Check for compiled server first (production packaged)
+    const compiledServerPaths = [
+      path.join(__dirname, '..', 'dist', 'server', 'app.cjs'),
+      path.join(__dirname, '..', 'dist', 'server.cjs'),
+      path.join(process.resourcesPath || '', 'dist', 'server', 'app.cjs'),
+    ];
+
+    for (const p of compiledServerPaths) {
+      if (fs.existsSync(p)) {
+        console.log(`[Electron Core] Cargando backend compilado desde: ${p}`);
+        const mod = require(p);
+        expressApp = mod.expressApp || mod.default || mod;
+        break;
+      }
+    }
+
+    // Development fallback
+    if (!expressApp) {
+      console.log('[Electron Core] Cargando backend en modo desarrollo...');
+      const mod = await import('../server/app.ts');
+      expressApp = mod.expressApp;
+    }
+
+    if (!expressApp) {
+      throw new Error('No se pudo resolver la aplicación Express.');
+    }
+
+    return new Promise((resolve, reject) => {
       serverInstance = http.createServer(expressApp);
       serverInstance.listen(0, '127.0.0.1', () => {
         serverPort = serverInstance.address().port;
-        console.log(`[Electron Core] Internal Express server running on port ${serverPort}`);
+        console.log(`[Electron Core] Servidor Express interno en http://127.0.0.1:${serverPort}`);
         resolve(serverPort);
+      });
+
+      serverInstance.on('error', (err) => {
+        reject(err);
       });
     });
   } catch (err) {
-    console.error('[Electron Core] Failed to start internal server:', err);
-    return 3000;
+    console.error('[Electron Core] Error fatal al iniciar servidor interno:', err);
+    dialog.showErrorBox(
+      'Error Crítico de Inicio',
+      `No se pudo iniciar el servicio interno de Universal Media Downloader:\n\n${err.message || err}\n\nLa aplicación se cerrará.`
+    );
+    app.quit();
+    throw err;
   }
 }
 
 function createWindow(port) {
   mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 950,
-    minHeight: 650,
+    width: 1240,
+    height: 840,
+    minWidth: 980,
+    minHeight: 680,
     backgroundColor: '#0A0E17',
     title: 'Universal Media Downloader',
     autoHideMenuBar: true,
@@ -41,9 +84,9 @@ function createWindow(port) {
     },
   });
 
-  const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production';
+  const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production' && Boolean(process.env.VITE_DEV_SERVER_URL);
 
-  if (isDev && process.env.VITE_DEV_SERVER_URL) {
+  if (isDev) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
     mainWindow.loadURL(`http://127.0.0.1:${port}`);
@@ -68,14 +111,14 @@ ipcMain.handle('dialog:select-directory', async () => {
 });
 
 ipcMain.handle('shell:open-file', async (_event, filePath) => {
-  if (filePath) {
+  if (filePath && typeof filePath === 'string') {
     return await shell.openPath(filePath);
   }
   return false;
 });
 
 ipcMain.handle('shell:show-item', async (_event, filePath) => {
-  if (filePath) {
+  if (filePath && typeof filePath === 'string') {
     shell.showItemInFolder(filePath);
     return true;
   }
@@ -94,14 +137,18 @@ ipcMain.handle('app:notify', (_event, { title, body }) => {
 });
 
 app.whenReady().then(async () => {
-  const port = await startInternalServer();
-  createWindow(port);
+  try {
+    const port = await startInternalServer();
+    createWindow(port);
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow(port);
-    }
-  });
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow(port);
+      }
+    });
+  } catch {
+    // Error already shown in dialog and app.quit() called
+  }
 });
 
 app.on('window-all-closed', () => {

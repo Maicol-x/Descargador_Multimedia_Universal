@@ -10,7 +10,7 @@ export class YtDlpService {
   public static async getVersion(): Promise<{ ok: boolean; version: string; path: string; error?: string }> {
     const ytdlpPath = BinaryResolver.resolveYtDlp();
     return new Promise((resolve) => {
-      exec(`"${ytdlpPath}" --version`, { timeout: 6000 }, (error, stdout, stderr) => {
+      exec(`"${ytdlpPath}" --version`, { timeout: 8000 }, (error, stdout, stderr) => {
         if (error) {
           resolve({
             ok: false,
@@ -29,65 +29,89 @@ export class YtDlpService {
     });
   }
 
+  /**
+   * Safe updater for yt-dlp:
+   * Writes to user runtime folder (AppData/UserData), verifies execution with --version,
+   * and performs atomic replacement with rollback on failure.
+   */
   public static async update(): Promise<{ ok: boolean; message: string; version?: string }> {
-    const ytdlpPath = BinaryResolver.resolveYtDlp();
-    return new Promise((resolve) => {
-      exec(`"${ytdlpPath}" -U`, { timeout: 45000 }, (error, stdout, stderr) => {
-        if (error) {
-          // If -U fails (e.g. non-git or package manager install), try direct download
-          return this.downloadLatestBinary()
-            .then((res) => resolve(res))
-            .catch((dlErr) => {
-              resolve({
-                ok: false,
-                message: `Error al actualizar: ${stderr || error.message || dlErr.message}`,
-              });
-            });
-        }
-
-        BinaryResolver.clearCache();
-        this.getVersion().then((v) => {
-          resolve({
-            ok: true,
-            message: stdout.trim() || 'yt-dlp actualizado con éxito.',
-            version: v.version,
-          });
-        });
-      });
-    });
-  }
-
-  private static async downloadLatestBinary(): Promise<{ ok: boolean; message: string; version?: string }> {
     const isWindows = process.platform === 'win32';
     const binaryName = isWindows ? 'yt-dlp.exe' : 'yt-dlp';
-    const downloadUrl = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${binaryName}`;
-    const targetDir = path.join(process.cwd(), 'binaries');
+    const runtimeDir = BinaryResolver.getUserRuntimeDir();
 
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
+    if (!fs.existsSync(runtimeDir)) {
+      fs.mkdirSync(runtimeDir, { recursive: true });
     }
 
-    const targetPath = path.join(targetDir, binaryName);
-    const cmd = isWindows
-      ? `powershell -Command "Invoke-WebRequest -Uri '${downloadUrl}' -OutFile '${targetPath}'"`
-      : `curl -L "${downloadUrl}" -o "${targetPath}" && chmod +x "${targetPath}"`;
+    const tempBinaryPath = path.join(runtimeDir, `${binaryName}.tmp`);
+    const targetBinaryPath = path.join(runtimeDir, binaryName);
+    const downloadUrl = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${binaryName}`;
 
-    return new Promise((resolve, reject) => {
-      exec(cmd, { timeout: 60000 }, (err) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        BinaryResolver.clearCache();
-        this.getVersion().then((v) => {
-          resolve({
-            ok: true,
-            message: 'Binario descargado e instalado correctamente.',
-            version: v.version,
-          });
+    console.log(`[YtDlpService] Descargando actualización hacia: ${tempBinaryPath}`);
+
+    const dlCmd = isWindows
+      ? `powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '${downloadUrl}' -OutFile '${tempBinaryPath}'"`
+      : `curl -sL "${downloadUrl}" -o "${tempBinaryPath}" && chmod +x "${tempBinaryPath}"`;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        exec(dlCmd, { timeout: 60000 }, (err) => {
+          if (err) return reject(err);
+          resolve();
         });
       });
-    });
+
+      if (!fs.existsSync(tempBinaryPath) || fs.statSync(tempBinaryPath).size < 1000000) {
+        throw new Error('El archivo descargado es inválido o está incompleto.');
+      }
+
+      if (!isWindows) {
+        fs.chmodSync(tempBinaryPath, 0o755);
+      }
+
+      // Verify the new binary works
+      const testVersion = await new Promise<string>((resolve, reject) => {
+        exec(`"${tempBinaryPath}" --version`, { timeout: 8000 }, (err, stdout) => {
+          if (err) return reject(err);
+          resolve(stdout.trim());
+        });
+      });
+
+      // Atomic rename
+      if (fs.existsSync(targetBinaryPath)) {
+        try {
+          fs.unlinkSync(targetBinaryPath);
+        } catch {
+          // On Windows, if file is locked, rename to old
+          try {
+            fs.renameSync(targetBinaryPath, path.join(runtimeDir, `${binaryName}.old`));
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      fs.renameSync(tempBinaryPath, targetBinaryPath);
+      BinaryResolver.clearCache();
+
+      return {
+        ok: true,
+        message: `yt-dlp actualizado con éxito a la versión ${testVersion}.`,
+        version: testVersion,
+      };
+    } catch (err: any) {
+      if (fs.existsSync(tempBinaryPath)) {
+        try {
+          fs.unlinkSync(tempBinaryPath);
+        } catch {
+          // ignore
+        }
+      }
+      return {
+        ok: false,
+        message: `Error al actualizar yt-dlp: ${err.message}`,
+      };
+    }
   }
 
   public static async analyzeUrl(rawUrl: string): Promise<MediaInfo> {
@@ -101,7 +125,6 @@ export class YtDlpService {
       '--dump-single-json',
       '--flat-playlist',
       '--no-warnings',
-      '--no-check-certificates',
       url,
     ];
 
@@ -143,7 +166,7 @@ export class YtDlpService {
             }));
           }
 
-          // Extract unique qualities available
+          // Extract unique real qualities available in the formats
           const qualities = new Set<string>();
           if (json.formats && Array.isArray(json.formats)) {
             json.formats.forEach((fmt: any) => {
@@ -158,17 +181,18 @@ export class YtDlpService {
             });
           }
 
-          const defaultQualities = ['1080p', '720p', '480p', '360p'];
-          const availableQualities = qualities.size > 0
-            ? Array.from(qualities).sort((a, b) => {
-                const numA = parseInt(a, 10) || 0;
-                const numB = parseInt(b, 10) || 0;
-                return numB - numA;
-              })
-            : defaultQualities;
+          const defaultQualities = ['1080p (Full HD)', '720p (HD)', '480p', '360p'];
+          const availableQualities =
+            qualities.size > 0
+              ? Array.from(qualities).sort((a, b) => {
+                  const numA = parseInt(a, 10) || 0;
+                  const numB = parseInt(b, 10) || 0;
+                  return numB - numA;
+                })
+              : defaultQualities;
 
-          // Always offer "Mejor disponible"
-          if (!availableQualities.includes('Mejor disponible')) {
+          // Always prepend "Mejor disponible"
+          if (!availableQualities.some((q) => q.includes('Mejor disponible'))) {
             availableQualities.unshift('Mejor disponible');
           }
 
@@ -214,7 +238,6 @@ export class YtDlpService {
     const ytdlpPath = BinaryResolver.resolveYtDlp();
     const ffmpegPath = BinaryResolver.resolveFfmpeg();
 
-    // Ensure download dir exists
     if (!fs.existsSync(task.downloadDir)) {
       try {
         fs.mkdirSync(task.downloadDir, { recursive: true });
@@ -226,9 +249,9 @@ export class YtDlpService {
 
     const outputTemplate = path.join(task.downloadDir, '%(title)s [%(id)s].%(ext)s');
     const args: string[] = [
+      '--continue',
       '--newline',
       '--no-warnings',
-      '--no-check-certificates',
       '--ffmpeg-location',
       path.dirname(ffmpegPath) || ffmpegPath,
       '-o',
@@ -240,7 +263,6 @@ export class YtDlpService {
       args.push('-x');
       args.push('--audio-format', audioFmt);
 
-      // Clean bitrate e.g. "320 kbps (Máxima)" -> "320k"
       const bitrateMatch = task.quality.match(/\d+/);
       const bitrate = bitrateMatch ? `${bitrateMatch[0]}k` : '320k';
       args.push('--audio-quality', bitrate);
@@ -258,6 +280,7 @@ export class YtDlpService {
       } else {
         args.push('-f', `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`);
       }
+
       args.push('--merge-output-format', videoFmt);
     }
 
@@ -277,9 +300,6 @@ export class YtDlpService {
           const line = rawLine.trim();
           if (!line) continue;
 
-          // Parsing progress e.g.:
-          // [download]  45.2% of  120.50MiB at  4.25MiB/s ETA 00:15
-          // [download]  100% of 120.50MiB in 00:28
           if (line.startsWith('[download]')) {
             const percentMatch = line.match(/(\d+(?:\.\d+)?)%/);
             const sizeMatch = line.match(/of\s+~?([0-9.]+\s*[A-Za-z]+)/);
@@ -291,17 +311,23 @@ export class YtDlpService {
             const speed = speedMatch ? speedMatch[1] : (task.speed || 'Calculando...');
             const eta = etaMatch ? etaMatch[1] : (task.eta || '--:--');
 
+            const destMatch = line.match(/Destination:\s+(.+)$/);
+            if (destMatch && destMatch[1]) {
+              finalFilePath = destMatch[1].trim();
+            }
+
             onProgress({
               status: progress >= 100 ? 'PROCESSING' : 'DOWNLOADING',
               progress,
               speed,
               eta,
               totalFormatted,
+              filePath: finalFilePath || task.filePath,
             });
           } else if (line.startsWith('[Merger]') || line.startsWith('[ExtractAudio]') || line.startsWith('[Fixup]')) {
             onProgress({
               status: 'PROCESSING',
-              speed: 'Procesando...',
+              speed: 'Procesando formatos...',
               eta: 'Finalizando',
             });
 
@@ -332,7 +358,7 @@ export class YtDlpService {
             progress: 100,
             speed: 'Completado',
             eta: '00:00',
-            filePath: finalFilePath || path.join(task.downloadDir, `${task.title}.${task.format}`),
+            filePath: finalFilePath || task.filePath || path.join(task.downloadDir, `${task.title}.${task.format}`),
             completedAt: Date.now(),
           });
         } else {
@@ -396,7 +422,6 @@ export class YtDlpService {
       return 'FFmpeg no fue encontrado en el sistema. Asegúrate de tener los binarios instalados.';
     }
 
-    // Clean any long command traceback
     const firstLine = raw.split('\n').find((l) => l.includes('ERROR:')) || raw.split('\n')[0];
     return firstLine.replace(/^ERROR:\s*/i, '').substring(0, 160) || 'Ocurrió un problema inesperado al procesar la solicitud.';
   }

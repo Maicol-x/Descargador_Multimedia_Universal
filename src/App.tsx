@@ -44,8 +44,9 @@ export default function App() {
   const [ytdlpVersion, setYtdlpVersion] = useState<string>('Detectando...');
   const [ffmpegStatus, setFfmpegStatus] = useState<boolean>(true);
 
-  // SSE event source ref
+  // SSE event source ref and notified task tracker
   const eventSourceRef = useRef<EventSource | null>(null);
+  const notifiedTaskIds = useRef<Set<string>>(new Set());
 
   // Initial Load: Settings, History, Engine Diagnostics
   useEffect(() => {
@@ -95,12 +96,15 @@ export default function App() {
               return [data.task, ...prev];
             });
 
-            // Trigger desktop notification if completed
-            if (data.task.status === 'COMPLETED' && (window as any).electronAPI?.notify) {
-              (window as any).electronAPI.notify({
-                title: 'Descarga Completada',
-                body: `${data.task.title} ha finalizado con éxito.`,
-              });
+            // Trigger desktop notification if completed (deduplicated)
+            if (data.task.status === 'COMPLETED' && !notifiedTaskIds.current.has(data.task.id)) {
+              notifiedTaskIds.current.add(data.task.id);
+              if ((window as any).electronAPI?.notify) {
+                (window as any).electronAPI.notify({
+                  title: 'Descarga Completada',
+                  body: `${data.task.title} ha finalizado con éxito.`,
+                });
+              }
             }
 
             // Refresh history if task finalized
@@ -222,7 +226,10 @@ export default function App() {
   };
 
   // 3. Playlist Specific Selection Download
-  const handlePlaylistSelectionDownload = async (selectedEntries: PlaylistEntry[]) => {
+  const handlePlaylistSelectionDownload = async (
+    selectedEntries: PlaylistEntry[],
+    config: { mode: MediaType; format: string; quality: string }
+  ) => {
     if (!mediaInfo || selectedEntries.length === 0) return;
 
     const items = selectedEntries.map((entry) => ({
@@ -230,9 +237,9 @@ export default function App() {
       title: entry.title,
       uploader: mediaInfo.uploader,
       thumbnail: entry.thumbnail || mediaInfo.thumbnail,
-      mode: 'video' as MediaType,
-      format: settings.defaultVideoFormat || 'mp4',
-      quality: settings.defaultVideoQuality || '1080p',
+      mode: config.mode,
+      format: config.format,
+      quality: config.quality,
       downloadDir: settings.downloadDir,
     }));
 
@@ -458,6 +465,8 @@ export default function App() {
           onClose={() => setIsPlaylistModalOpen(false)}
           playlistTitle={mediaInfo.title}
           entries={mediaInfo.entries}
+          availableVideoQualities={mediaInfo.availableVideoQualities}
+          availableAudioBitrates={mediaInfo.availableAudioBitrates}
           onConfirmSelection={handlePlaylistSelectionDownload}
         />
       )}

@@ -262,21 +262,40 @@ export const MediaPreviewCard: React.FC<MediaPreviewCardProps> = ({
             </div>
           </div>
 
-          {/* Action Button: Download */}
-          <div className="mt-5 flex items-center gap-3">
-            <button
-              id="start-download-btn"
-              onClick={handleDownload}
-              disabled={isSubmitting}
-              className="flex-1 py-3 px-6 rounded-xl bg-gradient-to-r from-[#3B82F6] to-[#2563EB] hover:from-[#2563EB] hover:to-blue-700 text-white font-bold text-sm md:text-base flex items-center justify-center gap-2.5 shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 active:scale-[0.99] transition-all"
-            >
-              <Download className="w-5 h-5 animate-bounce" />
-              <span>
-                {mediaInfo.isPlaylist
-                  ? `Descargar Playlist Completa (${mediaInfo.entries?.length || ''} pistas)`
-                  : 'Descargar Ahora'}
-              </span>
-            </button>
+          {/* Action Buttons */}
+          <div className="mt-5 flex flex-col sm:flex-row items-center gap-3">
+            {mediaInfo.isPlaylist ? (
+              <>
+                <button
+                  id="select-playlist-tracks-btn"
+                  onClick={onOpenPlaylistModal}
+                  className="w-full sm:flex-1 py-3 px-5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-sm md:text-base flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition-all active:scale-[0.99]"
+                >
+                  <ListMusic className="w-5 h-5" />
+                  <span>Seleccionar Pistas ({mediaInfo.entries?.length || mediaInfo.playlistCount || 0})</span>
+                </button>
+
+                <button
+                  id="download-all-playlist-btn"
+                  onClick={handleDownload}
+                  disabled={isSubmitting}
+                  className="w-full sm:w-auto py-3 px-5 rounded-xl bg-[#1E293B] hover:bg-[#334155] text-[#F8FAFC] font-semibold text-sm flex items-center justify-center gap-2 border border-white/10 transition-all active:scale-[0.99]"
+                >
+                  <Download className="w-4 h-4 text-blue-400" />
+                  <span>Descargar Todo</span>
+                </button>
+              </>
+            ) : (
+              <button
+                id="start-download-btn"
+                onClick={handleDownload}
+                disabled={isSubmitting}
+                className="w-full py-3 px-6 rounded-xl bg-gradient-to-r from-[#3B82F6] to-[#2563EB] hover:from-[#2563EB] hover:to-blue-700 text-white font-bold text-sm md:text-base flex items-center justify-center gap-2.5 shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 active:scale-[0.99] transition-all"
+              >
+                <Download className="w-5 h-5 animate-bounce" />
+                <span>Descargar Ahora</span>
+              </button>
+            )}
           </div>
         </div>
       </div>

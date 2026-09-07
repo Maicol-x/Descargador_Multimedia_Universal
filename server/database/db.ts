@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { AppSettings, DownloadHistoryItem } from '../../src/types/index.ts';
+import { AppSettings, DownloadHistoryItem, DownloadTask } from '../../src/types/index.ts';
 
 class AppDatabase {
   private db: Database.Database;
@@ -19,7 +19,6 @@ class AppDatabase {
   }
 
   private resolveDbDirectory(): string {
-    // If running in packaged electron or user profile is specified
     if (process.env.APPDATA) {
       return path.join(process.env.APPDATA, 'UniversalMediaDownloader');
     }
@@ -63,11 +62,13 @@ class AppDatabase {
       CREATE TABLE IF NOT EXISTS downloads (
         id TEXT PRIMARY KEY,
         data TEXT NOT NULL,
+        status TEXT NOT NULL,
         updatedAt INTEGER NOT NULL
       );
     `);
   }
 
+  // --- SETTINGS ---
   public getSettings(): AppSettings {
     const defaultDownloads = path.join(os.homedir(), 'Downloads');
     const defaults: AppSettings = {
@@ -106,6 +107,63 @@ class AppDatabase {
     return updated;
   }
 
+  // --- ACTIVE TASKS (QUEUE PERSISTENCE) ---
+  public saveTask(task: DownloadTask): void {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO downloads (id, data, status, updatedAt)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          data = excluded.data,
+          status = excluded.status,
+          updatedAt = excluded.updatedAt
+      `);
+      stmt.run(task.id, JSON.stringify(task), task.status, Date.now());
+    } catch (err) {
+      console.error('Failed to persist task in DB:', err);
+    }
+  }
+
+  public getSavedTasks(): DownloadTask[] {
+    try {
+      const stmt = this.db.prepare('SELECT data FROM downloads ORDER BY updatedAt ASC');
+      const rows = stmt.all() as { data: string }[];
+      return rows
+        .map((r) => {
+          try {
+            return JSON.parse(r.data) as DownloadTask;
+          } catch {
+            return null;
+          }
+        })
+        .filter((t): t is DownloadTask => t !== null);
+    } catch (err) {
+      console.error('Failed to load saved tasks from DB:', err);
+      return [];
+    }
+  }
+
+  public deleteTask(id: string): void {
+    try {
+      const stmt = this.db.prepare('DELETE FROM downloads WHERE id = ?');
+      stmt.run(id);
+    } catch (err) {
+      console.error('Failed to delete task from DB:', err);
+    }
+  }
+
+  public clearCompletedTasks(): void {
+    try {
+      const stmt = this.db.prepare(
+        "DELETE FROM downloads WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')"
+      );
+      stmt.run();
+    } catch (err) {
+      console.error('Failed to clear completed tasks from DB:', err);
+    }
+  }
+
+  // --- HISTORY ---
   public getHistory(): DownloadHistoryItem[] {
     try {
       const stmt = this.db.prepare('SELECT * FROM history ORDER BY createdAt DESC LIMIT 200');
