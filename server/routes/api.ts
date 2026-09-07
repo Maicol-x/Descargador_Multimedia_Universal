@@ -45,6 +45,8 @@ apiRouter.post('/download', (req: Request, res: Response) => {
 
   for (const item of items) {
     if (!item.url || typeof item.url !== 'string') continue;
+    const cleanUrl = item.url.trim();
+    if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) continue;
 
     const taskId = `task_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const downloadDir =
@@ -54,8 +56,9 @@ apiRouter.post('/download', (req: Request, res: Response) => {
 
     const task: DownloadTask = {
       id: taskId,
-      url: item.url.trim(),
-      title: (item.title || 'Descarga Multimedia').trim(),
+      url: cleanUrl,
+      title: (item.title || 'Descarga Multimedia').trim().substring(0, 300),
+
       uploader: item.uploader,
       thumbnail: item.thumbnail,
       mode: item.mode === 'audio' ? 'audio' : 'video',
@@ -233,7 +236,13 @@ apiRouter.post('/ytdlp/update', async (_req: Request, res: Response) => {
   res.json(result);
 });
 
-// 10. SAFE OPEN FILE / FOLDER (Without command injection)
+const ALLOWED_MEDIA_EXTENSIONS = new Set([
+  '.mp4', '.mkv', '.webm', '.avi', '.mov', '.wmv', '.flv', '.m4v',
+  '.mp3', '.m4a', '.aac', '.flac', '.wav', '.opus', '.ogg',
+  '.part', '.ytdl', '.jpg', '.jpeg', '.png', '.webp', '.srt', '.vtt'
+]);
+
+// 10. SAFE OPEN FILE / FOLDER (Without command injection or arbitrary execution)
 apiRouter.post('/open-file', (req: Request, res: Response) => {
   const { filePath } = req.body;
   if (!filePath || typeof filePath !== 'string') {
@@ -245,15 +254,33 @@ apiRouter.post('/open-file', (req: Request, res: Response) => {
     return res.status(404).json({ error: 'El archivo especificado no existe.' });
   }
 
+  try {
+    const stat = fs.statSync(safePath);
+    if (!stat.isFile()) {
+      return res.status(400).json({ error: 'La ruta especificada no es un archivo regular.' });
+    }
+  } catch {
+    return res.status(500).json({ error: 'Error al inspeccionar el archivo.' });
+  }
+
+  const ext = path.extname(safePath).toLowerCase();
+  if (!ALLOWED_MEDIA_EXTENSIONS.has(ext)) {
+    return res.status(403).json({ error: 'Tipo de archivo restringido por seguridad.' });
+  }
+
   const isWindows = process.platform === 'win32';
   const isMac = process.platform === 'darwin';
 
-  if (isWindows) {
-    spawn('explorer.exe', ['/select,', safePath], { detached: true });
-  } else if (isMac) {
-    spawn('open', ['-R', safePath], { detached: true });
-  } else {
-    spawn('xdg-open', [path.dirname(safePath)], { detached: true });
+  try {
+    if (isWindows) {
+      spawn('explorer.exe', ['/select,', safePath], { detached: true });
+    } else if (isMac) {
+      spawn('open', ['-R', safePath], { detached: true });
+    } else {
+      spawn('xdg-open', [path.dirname(safePath)], { detached: true });
+    }
+  } catch (err: any) {
+    return res.status(500).json({ error: `No se pudo abrir el archivo: ${err.message}` });
   }
 
   return res.json({ success: true });
@@ -272,16 +299,59 @@ apiRouter.post('/open-folder', (req: Request, res: Response) => {
     return res.status(404).json({ error: 'La carpeta no existe.' });
   }
 
+  try {
+    const stat = fs.statSync(safePath);
+    if (!stat.isDirectory()) {
+      return res.status(400).json({ error: 'La ruta especificada no es un directorio.' });
+    }
+  } catch {
+    return res.status(500).json({ error: 'Error al inspeccionar la carpeta.' });
+  }
+
   const isWindows = process.platform === 'win32';
   const isMac = process.platform === 'darwin';
 
-  if (isWindows) {
-    spawn('explorer.exe', [safePath], { detached: true });
-  } else if (isMac) {
-    spawn('open', [safePath], { detached: true });
-  } else {
-    spawn('xdg-open', [safePath], { detached: true });
+  try {
+    if (isWindows) {
+      spawn('explorer.exe', [safePath], { detached: true });
+    } else if (isMac) {
+      spawn('open', [safePath], { detached: true });
+    } else {
+      spawn('xdg-open', [safePath], { detached: true });
+    }
+  } catch (err: any) {
+    return res.status(500).json({ error: `No se pudo abrir la carpeta: ${err.message}` });
   }
 
   return res.json({ success: true });
 });
+
+// 11. WEB DOWNLOAD STREAM (For browser environment)
+apiRouter.get('/files/download', (req: Request, res: Response) => {
+  const filePath = req.query.path as string;
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'Ruta no válida.' });
+  }
+
+  const safePath = path.normalize(filePath);
+  if (!fs.existsSync(safePath)) {
+    return res.status(404).json({ error: 'Archivo no encontrado.' });
+  }
+
+  try {
+    const stat = fs.statSync(safePath);
+    if (!stat.isFile()) {
+      return res.status(400).json({ error: 'No es un archivo descargable.' });
+    }
+  } catch {
+    return res.status(500).json({ error: 'Error al acceder al archivo.' });
+  }
+
+  const ext = path.extname(safePath).toLowerCase();
+  if (!ALLOWED_MEDIA_EXTENSIONS.has(ext)) {
+    return res.status(403).json({ error: 'Tipo de archivo no permitido para descarga web.' });
+  }
+
+  return res.download(safePath);
+});
+

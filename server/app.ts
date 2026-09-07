@@ -4,6 +4,11 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { apiRouter } from './routes/api.ts';
+import { YtDlpService } from './services/YtDlpService.ts';
+
+export function cleanupAllProcesses(): void {
+  YtDlpService.cleanupAllProcesses();
+}
 
 export function createExpressApp(): Express {
   const app = express();

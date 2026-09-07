@@ -177,6 +177,13 @@ export default function App() {
     // Check if playlist
     if (mediaInfo.isPlaylist && mediaInfo.entries && mediaInfo.entries.length > 0) {
       // Download all entries in playlist
+      const baseDir = config.downloadDir || settings.downloadDir;
+      const safeFolder = (mediaInfo.title || 'Playlist')
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .trim()
+        .substring(0, 80);
+      const playlistDir = settings.createPlaylistFolder ? `${baseDir}/${safeFolder}` : baseDir;
+
       const items = mediaInfo.entries.map((entry) => ({
         url: entry.url,
         title: entry.title,
@@ -185,7 +192,7 @@ export default function App() {
         mode: config.mode,
         format: config.format,
         quality: config.quality,
-        downloadDir: config.downloadDir || settings.downloadDir,
+        downloadDir: playlistDir,
       }));
 
       try {
@@ -200,6 +207,7 @@ export default function App() {
       }
       return;
     }
+
 
     // Single item download
     const item = {
@@ -286,13 +294,16 @@ export default function App() {
     if ((window as any).electronAPI?.openFile) {
       (window as any).electronAPI.openFile(filePath);
     } else {
-      fetch('/api/open-file', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath }),
-      });
+      // In web browser environment, trigger browser direct download of the completed media file
+      const link = document.createElement('a');
+      link.href = `/api/files/download?path=${encodeURIComponent(filePath)}`;
+      link.setAttribute('download', '');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     }
   };
+
 
   const handleOpenFolder = (folderPath?: string) => {
     const target = folderPath || settings.downloadDir;

@@ -14,9 +14,25 @@ class AppDatabase {
     }
 
     const dbPath = path.join(dbDir, 'universal_downloader.db');
-    this.db = new Database(dbPath);
-    this.initSchema();
+    try {
+      this.db = new Database(dbPath);
+      this.initSchema();
+    } catch (err: any) {
+      console.error('[AppDatabase] Error inicializando SQLite, activando recuperación automática:', err);
+      if (fs.existsSync(dbPath)) {
+        const corruptPath = path.join(dbDir, `universal_downloader.corrupt_${Date.now()}.db`);
+        try {
+          fs.renameSync(dbPath, corruptPath);
+          console.warn(`[AppDatabase] Archivo corrupto respaldado en: ${corruptPath}`);
+        } catch {
+          // ignore
+        }
+      }
+      this.db = new Database(dbPath);
+      this.initSchema();
+    }
   }
+
 
   private resolveDbDirectory(): string {
     if (process.env.APPDATA) {

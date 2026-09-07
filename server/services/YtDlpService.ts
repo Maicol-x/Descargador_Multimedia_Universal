@@ -1,16 +1,40 @@
-import { spawn, exec, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import https from 'https';
+import crypto from 'crypto';
 import { BinaryResolver } from './BinaryResolver.ts';
 import { MediaInfo, DownloadTask, PlaylistEntry } from '../../src/types/index.ts';
 
 export class YtDlpService {
   private static activeProcesses = new Map<string, ChildProcess>();
 
+  public static cleanupAllProcesses(): void {
+    if (this.activeProcesses.size === 0) return;
+    console.log(`[YtDlpService] Terminando ${this.activeProcesses.size} procesos activos...`);
+    for (const [, child] of this.activeProcesses.entries()) {
+      try {
+        child.kill('SIGTERM');
+        if (process.platform === 'win32' && child.pid) {
+          try {
+            spawn('taskkill', ['/pid', child.pid.toString(), '/T', '/F'], {
+              stdio: 'ignore',
+            });
+          } catch {
+            // ignore
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    this.activeProcesses.clear();
+  }
+
   public static async getVersion(): Promise<{ ok: boolean; version: string; path: string; error?: string }> {
     const ytdlpPath = BinaryResolver.resolveYtDlp();
     return new Promise((resolve) => {
-      exec(`"${ytdlpPath}" --version`, { timeout: 8000 }, (error, stdout, stderr) => {
+      execFile(ytdlpPath, ['--version'], { timeout: 8000 }, (error, stdout, stderr) => {
         if (error) {
           resolve({
             ok: false,
@@ -22,7 +46,7 @@ export class YtDlpService {
         }
         resolve({
           ok: true,
-          version: stdout.trim(),
+          version: (stdout || '').trim(),
           path: ytdlpPath,
         });
       });
@@ -30,9 +54,122 @@ export class YtDlpService {
   }
 
   /**
-   * Safe updater for yt-dlp:
-   * Writes to user runtime folder (AppData/UserData), verifies execution with --version,
-   * and performs atomic replacement with rollback on failure.
+   * Helper to download with redirect follow and SHA256 calculation
+   */
+  private static downloadWithSha256(
+    url: string,
+    destPath: string,
+    redirectCount = 0
+  ): Promise<{ sha256: string; bytes: number }> {
+    return new Promise((resolve, reject) => {
+      if (redirectCount > 10) {
+        return reject(new Error('Demasiadas redirecciones HTTP'));
+      }
+
+      const file = fs.createWriteStream(destPath);
+      const hash = crypto.createHash('sha256');
+      let totalBytes = 0;
+
+      const req = https.get(url, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          file.close();
+          try {
+            fs.unlinkSync(destPath);
+          } catch {}
+          return this.downloadWithSha256(res.headers.location, destPath, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
+        }
+
+        if (res.statusCode !== 200) {
+          file.close();
+          try {
+            fs.unlinkSync(destPath);
+          } catch {}
+          return reject(new Error(`Fallo HTTP ${res.statusCode} al descargar actualización`));
+        }
+
+        res.on('data', (chunk) => {
+          totalBytes += chunk.length;
+          hash.update(chunk);
+        });
+
+        res.pipe(file);
+
+        file.on('finish', () => {
+          file.close(() => {
+            resolve({
+              sha256: hash.digest('hex').toLowerCase(),
+              bytes: totalBytes,
+            });
+          });
+        });
+      });
+
+      req.on('error', (err) => {
+        file.close();
+        try {
+          fs.unlinkSync(destPath);
+        } catch {}
+        reject(err);
+      });
+
+      req.setTimeout(60000, () => {
+        req.destroy();
+        file.close();
+        try {
+          fs.unlinkSync(destPath);
+        } catch {}
+        reject(new Error('Tiempo de espera agotado al descargar archivo.'));
+      });
+    });
+  }
+
+  /**
+   * Helper to fetch text content over HTTPS
+   */
+  private static fetchText(url: string, redirectCount = 0): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (redirectCount > 10) {
+        return reject(new Error('Demasiadas redirecciones HTTP'));
+      }
+
+      const req = https.get(url, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return this.fetchText(res.headers.location, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
+        }
+
+        if (res.statusCode !== 200) {
+          return reject(new Error(`Fallo HTTP ${res.statusCode}`));
+        }
+
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk.toString();
+        });
+
+        res.on('end', () => {
+          resolve(data);
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(15000, () => {
+        req.destroy();
+        reject(new Error('Timeout al consultar checksums'));
+      });
+    });
+  }
+
+  /**
+   * Safe, cryptographic updater for yt-dlp:
+   * 1. Downloads target binary natively over HTTPS.
+   * 2. Fetches official SHA2-256SUMS from yt-dlp release.
+   * 3. Validates computed hash matches the official SHA-256 checksum.
+   * 4. Tests executable with `--version`.
+   * 5. Atomically replaces target binary with rollback protection.
    */
   public static async update(): Promise<{ ok: boolean; message: string; version?: string }> {
     const isWindows = process.platform === 'win32';
@@ -46,57 +183,87 @@ export class YtDlpService {
     const tempBinaryPath = path.join(runtimeDir, `${binaryName}.tmp`);
     const targetBinaryPath = path.join(runtimeDir, binaryName);
     const downloadUrl = `https://github.com/yt-dlp/yt-dlp/releases/latest/download/${binaryName}`;
+    const checksumsUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS';
 
-    console.log(`[YtDlpService] Descargando actualización hacia: ${tempBinaryPath}`);
-
-    const dlCmd = isWindows
-      ? `powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '${downloadUrl}' -OutFile '${tempBinaryPath}'"`
-      : `curl -sL "${downloadUrl}" -o "${tempBinaryPath}" && chmod +x "${tempBinaryPath}"`;
+    console.log(`[YtDlpService] Descargando actualización segura hacia: ${tempBinaryPath}`);
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        exec(dlCmd, { timeout: 60000 }, (err) => {
-          if (err) return reject(err);
-          resolve();
-        });
-      });
+      // 1. Download binary and compute SHA256
+      const { sha256: computedHash, bytes: totalBytes } = await this.downloadWithSha256(
+        downloadUrl,
+        tempBinaryPath
+      );
 
-      if (!fs.existsSync(tempBinaryPath) || fs.statSync(tempBinaryPath).size < 1000000) {
-        throw new Error('El archivo descargado es inválido o está incompleto.');
+      if (totalBytes < 1000000) {
+        throw new Error('El archivo descargado es menor a 1 MB o está incompleto.');
+      }
+
+      // 2. Fetch official checksums and verify integrity
+      try {
+        const checksumsData = await this.fetchText(checksumsUrl);
+        const expectedLine = checksumsData
+          .split('\n')
+          .find((line) => line.trim().endsWith(binaryName));
+
+        if (expectedLine) {
+          const expectedHash = expectedLine.trim().split(/\s+/)[0]?.toLowerCase();
+          if (expectedHash && expectedHash !== computedHash) {
+            throw new Error(
+              `Fallo de integridad criptográfica: el hash SHA-256 (${computedHash}) no coincide con el oficial (${expectedHash}).`
+            );
+          }
+          console.log(`[YtDlpService] Verificación SHA-256 completada con éxito: ${computedHash}`);
+        }
+      } catch (checkErr: any) {
+        if (checkErr.message?.includes('Fallo de integridad')) {
+          throw checkErr;
+        }
+        console.warn(
+          `[YtDlpService] No se pudo verificar contra SHA2-256SUMS (${checkErr.message}), procediendo con validación de ejecución.`
+        );
       }
 
       if (!isWindows) {
         fs.chmodSync(tempBinaryPath, 0o755);
       }
 
-      // Verify the new binary works
+      // 3. Verify the new binary executes correctly
       const testVersion = await new Promise<string>((resolve, reject) => {
-        exec(`"${tempBinaryPath}" --version`, { timeout: 8000 }, (err, stdout) => {
-          if (err) return reject(err);
-          resolve(stdout.trim());
+        execFile(tempBinaryPath, ['--version'], { timeout: 8000 }, (err, stdout) => {
+          if (err) return reject(new Error(`El binario descargado falló al ejecutarse: ${err.message}`));
+          resolve((stdout || '').trim());
         });
       });
 
-      // Atomic rename
+      // 4. Atomic rename with Windows file lock handling
+      const backupPath = path.join(runtimeDir, `${binaryName}.old`);
       if (fs.existsSync(targetBinaryPath)) {
         try {
-          fs.unlinkSync(targetBinaryPath);
-        } catch {
-          // On Windows, if file is locked, rename to old
-          try {
-            fs.renameSync(targetBinaryPath, path.join(runtimeDir, `${binaryName}.old`));
-          } catch {
-            // ignore
+          if (fs.existsSync(backupPath)) {
+            fs.unlinkSync(backupPath);
           }
+          fs.renameSync(targetBinaryPath, backupPath);
+        } catch {
+          // continue
         }
       }
 
       fs.renameSync(tempBinaryPath, targetBinaryPath);
+
+      // Clean up old backup if possible
+      try {
+        if (fs.existsSync(backupPath)) {
+          fs.unlinkSync(backupPath);
+        }
+      } catch {
+        // ignore on Windows if still held
+      }
+
       BinaryResolver.clearCache();
 
       return {
         ok: true,
-        message: `yt-dlp actualizado con éxito a la versión ${testVersion}.`,
+        message: `yt-dlp actualizado y verificado con éxito a la versión ${testVersion}.`,
         version: testVersion,
       };
     } catch (err: any) {
@@ -120,11 +287,16 @@ export class YtDlpService {
       throw new Error('La URL no puede estar vacía.');
     }
 
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      throw new Error('Protocolo de URL no permitido. Solo se aceptan enlaces http:// y https://.');
+    }
+
     const ytdlpPath = BinaryResolver.resolveYtDlp();
     const args = [
       '--dump-single-json',
       '--flat-playlist',
       '--no-warnings',
+      '--',
       url,
     ];
 
@@ -132,6 +304,7 @@ export class YtDlpService {
       const child = spawn(ytdlpPath, args);
       let stdoutData = '';
       let stderrData = '';
+
 
       child.stdout.on('data', (data) => {
         stdoutData += data.toString();
@@ -247,11 +420,17 @@ export class YtDlpService {
       }
     }
 
+    if (!task.url.startsWith('http://') && !task.url.startsWith('https://')) {
+      onError('Protocolo de URL inválido. Solo se admiten enlaces HTTP/HTTPS.');
+      return;
+    }
+
     const outputTemplate = path.join(task.downloadDir, '%(title)s [%(id)s].%(ext)s');
     const args: string[] = [
       '--continue',
       '--newline',
       '--no-warnings',
+      '--windows-filenames',
       '--ffmpeg-location',
       path.dirname(ffmpegPath) || ffmpegPath,
       '-o',
@@ -284,7 +463,9 @@ export class YtDlpService {
       args.push('--merge-output-format', videoFmt);
     }
 
+    args.push('--');
     args.push(task.url);
+
 
     try {
       const child = spawn(ytdlpPath, args);

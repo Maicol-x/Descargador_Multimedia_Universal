@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 
 export class BinaryResolver {
   private static cachedYtDlp: string | null = null;
@@ -18,6 +18,24 @@ export class BinaryResolver {
       return path.join(process.env.HOME, '.universal_media_downloader', 'runtime');
     }
     return path.join(process.cwd(), 'runtime');
+  }
+
+  private static findInPath(binaryName: string, isWindows: boolean): string | null {
+    try {
+      const tool = isWindows ? 'where.exe' : 'which';
+      const output = execFileSync(tool, [binaryName], {
+        encoding: 'utf-8',
+        timeout: 3000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const first = output.trim().split(/\r?\n/)[0]?.trim();
+      if (first && fs.existsSync(first)) {
+        return first;
+      }
+    } catch {
+      // not in PATH
+    }
+    return null;
   }
 
   /**
@@ -93,18 +111,10 @@ export class BinaryResolver {
     }
 
     // 4. System PATH fallback
-    try {
-      const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
-        .trim()
-        .split(/\r?\n/)[0]
-        .trim();
-      if (pathOutput && fs.existsSync(pathOutput)) {
-        this.cachedYtDlp = pathOutput;
-        return pathOutput;
-      }
-    } catch {
-      // not in PATH
+    const systemPath = this.findInPath(binaryName, isWindows);
+    if (systemPath) {
+      this.cachedYtDlp = systemPath;
+      return systemPath;
     }
 
     // 5. Unix standard system locations
@@ -164,18 +174,10 @@ export class BinaryResolver {
     }
 
     // 3. System PATH
-    try {
-      const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
-        .trim()
-        .split(/\r?\n/)[0]
-        .trim();
-      if (pathOutput && fs.existsSync(pathOutput)) {
-        this.cachedFfmpeg = pathOutput;
-        return pathOutput;
-      }
-    } catch {
-      // not in PATH
+    const systemPath = this.findInPath(binaryName, isWindows);
+    if (systemPath) {
+      this.cachedFfmpeg = systemPath;
+      return systemPath;
     }
 
     // 4. Standard system locations
@@ -230,18 +232,10 @@ export class BinaryResolver {
     }
 
     // 3. System PATH
-    try {
-      const checkCmd = isWindows ? `where ${binaryName}` : `which ${binaryName}`;
-      const pathOutput = execSync(checkCmd, { encoding: 'utf-8', timeout: 3000 })
-        .trim()
-        .split(/\r?\n/)[0]
-        .trim();
-      if (pathOutput && fs.existsSync(pathOutput)) {
-        this.cachedFfprobe = pathOutput;
-        return pathOutput;
-      }
-    } catch {
-      // not in PATH
+    const systemPath = this.findInPath(binaryName, isWindows);
+    if (systemPath) {
+      this.cachedFfprobe = systemPath;
+      return systemPath;
     }
 
     // 4. Standard system locations

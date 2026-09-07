@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { BinaryResolver } from './BinaryResolver.ts';
 
 export interface FfmpegInfo {
@@ -12,7 +12,7 @@ export class FfmpegService {
   public static async getFfmpegInfo(): Promise<FfmpegInfo> {
     const ffmpegPath = BinaryResolver.resolveFfmpeg();
     return new Promise((resolve) => {
-      exec(`"${ffmpegPath}" -version`, { timeout: 4000 }, (error, stdout) => {
+      execFile(ffmpegPath, ['-version'], { timeout: 5000 }, (error, stdout) => {
         if (error) {
           resolve({
             installed: false,
@@ -23,7 +23,7 @@ export class FfmpegService {
           return;
         }
 
-        const firstLine = stdout.split('\n')[0] || '';
+        const firstLine = (stdout || '').split('\n')[0] || '';
         const match = firstLine.match(/ffmpeg version ([^\s]+)/i);
         const version = match ? match[1] : firstLine.substring(0, 30);
 
@@ -39,7 +39,7 @@ export class FfmpegService {
   public static async getFfprobeInfo(): Promise<FfmpegInfo> {
     const ffprobePath = BinaryResolver.resolveFfprobe();
     return new Promise((resolve) => {
-      exec(`"${ffprobePath}" -version`, { timeout: 4000 }, (error, stdout) => {
+      execFile(ffprobePath, ['-version'], { timeout: 5000 }, (error, stdout) => {
         if (error) {
           resolve({
             installed: false,
@@ -50,7 +50,7 @@ export class FfmpegService {
           return;
         }
 
-        const firstLine = stdout.split('\n')[0] || '';
+        const firstLine = (stdout || '').split('\n')[0] || '';
         const match = firstLine.match(/ffprobe version ([^\s]+)/i);
         const version = match ? match[1] : firstLine.substring(0, 30);
 
@@ -63,3 +63,4 @@ export class FfmpegService {
     });
   }
 }
+

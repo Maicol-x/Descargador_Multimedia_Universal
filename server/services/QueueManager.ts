@@ -75,22 +75,40 @@ export class QueueManager {
     res.write(`data: ${initialPayload}\n\n`);
   }
 
-  private broadcastTaskUpdate(task: DownloadTask): void {
-    appDb.saveTask(task);
-    const payload = JSON.stringify({
-      type: 'TASK_UPDATED',
-      task,
-    });
-    for (const client of this.sseClients) {
-      try {
-        client.write(`data: ${payload}\n\n`);
-      } catch {
-        this.sseClients.delete(client);
+  private lastDbSave = new Map<string, number>();
+  private lastSseEmit = new Map<string, number>();
+
+  private broadcastTaskUpdate(task: DownloadTask, forceDb = true): void {
+    const now = Date.now();
+    const lastSave = this.lastDbSave.get(task.id) || 0;
+
+    // Persist to DB on status changes, completion, or if 1.5s elapsed
+    if (forceDb || now - lastSave > 1500) {
+      appDb.saveTask(task);
+      this.lastDbSave.set(task.id, now);
+    }
+
+    const lastEmit = this.lastSseEmit.get(task.id) || 0;
+    // Throttle SSE stream if not forced to at most once every 150ms
+    if (forceDb || now - lastEmit > 150) {
+      const payload = JSON.stringify({
+        type: 'TASK_UPDATED',
+        task,
+      });
+      for (const client of this.sseClients) {
+        try {
+          client.write(`data: ${payload}\n\n`);
+        } catch {
+          this.sseClients.delete(client);
+        }
       }
+      this.lastSseEmit.set(task.id, now);
     }
   }
 
   private broadcastTaskRemoved(taskId: string): void {
+    this.lastDbSave.delete(taskId);
+    this.lastSseEmit.delete(taskId);
     appDb.deleteTask(taskId);
     const payload = JSON.stringify({
       type: 'TASK_REMOVED',
@@ -104,6 +122,7 @@ export class QueueManager {
       }
     }
   }
+
 
   // --- WORKER CONCURRENCY GUARDS ---
   private acquireWorker(taskId: string): boolean {
@@ -237,55 +256,58 @@ export class QueueManager {
     const settings = appDb.getSettings();
     const maxConcurrency = Math.max(1, Math.min(5, settings.maxConcurrency || 3));
 
-    if (this.runningTaskIds.size >= maxConcurrency) {
-      return;
+    while (this.runningTaskIds.size < maxConcurrency) {
+      // Find oldest QUEUED task
+      const nextTask = Array.from(this.tasks.values())
+        .filter((t) => t.status === 'QUEUED')
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+
+      if (!nextTask) break;
+
+      if (!this.acquireWorker(nextTask.id)) {
+        break;
+      }
+
+      this.startTaskWorker(nextTask);
     }
+  }
 
-    // Find next QUEUED task
-    const nextTask = Array.from(this.tasks.values())
-      .filter((t) => t.status === 'QUEUED')
-      .sort((a, b) => a.createdAt - b.createdAt)[0];
-
-    if (!nextTask) return;
-
-    if (!this.acquireWorker(nextTask.id)) {
-      return;
-    }
-
-    nextTask.status = 'DOWNLOADING';
-    nextTask.speed = 'Iniciando descarga...';
-    this.broadcastTaskUpdate(nextTask);
+  private startTaskWorker(task: DownloadTask): void {
+    task.status = 'DOWNLOADING';
+    task.speed = 'Iniciando descarga...';
+    this.broadcastTaskUpdate(task, true);
 
     YtDlpService.startDownload(
-      nextTask,
+      task,
       (progressUpdates) => {
         // Guard against stale callbacks if task was already paused/cancelled
-        if (nextTask.status === 'PAUSED' || nextTask.status === 'CANCELLED') return;
-        Object.assign(nextTask, progressUpdates);
-        this.broadcastTaskUpdate(nextTask);
+        if (task.status === 'PAUSED' || task.status === 'CANCELLED') return;
+        Object.assign(task, progressUpdates);
+        this.broadcastTaskUpdate(task, false);
       },
       (completionUpdates) => {
-        this.releaseWorker(nextTask.id);
-        Object.assign(nextTask, completionUpdates);
-        this.broadcastTaskUpdate(nextTask);
-        this.saveToHistory(nextTask);
+        this.releaseWorker(task.id);
+        Object.assign(task, completionUpdates);
+        this.broadcastTaskUpdate(task, true);
+        this.saveToHistory(task);
         this.processNextInQueue();
       },
       (errorMessage) => {
-        this.releaseWorker(nextTask.id);
-        if (nextTask.status === 'PAUSED' || nextTask.status === 'CANCELLED') {
+        this.releaseWorker(task.id);
+        if (task.status === 'PAUSED' || task.status === 'CANCELLED') {
           return;
         }
-        nextTask.status = 'FAILED';
-        nextTask.error = errorMessage;
-        nextTask.speed = 'Error';
-        nextTask.eta = '--:--';
-        this.broadcastTaskUpdate(nextTask);
-        this.saveToHistory(nextTask);
+        task.status = 'FAILED';
+        task.error = errorMessage;
+        task.speed = 'Error';
+        task.eta = '--:--';
+        this.broadcastTaskUpdate(task, true);
+        this.saveToHistory(task);
         this.processNextInQueue();
       }
     );
   }
+
 
   private saveToHistory(task: DownloadTask): void {
     const historyItem: DownloadHistoryItem = {

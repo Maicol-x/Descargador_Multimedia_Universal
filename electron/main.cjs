@@ -6,6 +6,21 @@ const fs = require('fs');
 let mainWindow = null;
 let serverInstance = null;
 let serverPort = 3000;
+let serverCleanupFn = null;
+
+// Single Instance Lock: prevent multiple instances competing for SQLite and downloads
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  console.log('[Electron Core] Otra instancia ya está en ejecución. Saliendo...');
+  app.quit();
+}
+
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
+});
 
 // Propagate Electron resources path to Node environment
 process.env.IS_ELECTRON = 'true';
@@ -29,6 +44,7 @@ async function startInternalServer() {
         console.log(`[Electron Core] Cargando backend compilado desde: ${p}`);
         const mod = require(p);
         expressApp = mod.expressApp || mod.default || mod;
+        serverCleanupFn = mod.cleanupAllProcesses;
         break;
       }
     }
@@ -38,6 +54,7 @@ async function startInternalServer() {
       console.log('[Electron Core] Cargando backend en modo desarrollo...');
       const mod = await import('../server/app.ts');
       expressApp = mod.expressApp;
+      serverCleanupFn = mod.cleanupAllProcesses;
     }
 
     if (!expressApp) {
@@ -84,6 +101,26 @@ function createWindow(port) {
     },
   });
 
+  // Security: Disallow arbitrary window openings; redirect external links to OS default browser
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+    try {
+      const parsed = new URL(navigationUrl);
+      if (parsed.origin !== `http://127.0.0.1:${port}` && parsed.protocol !== 'devtools:') {
+        event.preventDefault();
+        shell.openExternal(navigationUrl);
+      }
+    } catch {
+      // ignore
+    }
+  });
+
   const isDev = !app.isPackaged && process.env.NODE_ENV !== 'production' && Boolean(process.env.VITE_DEV_SERVER_URL);
 
   if (isDev) {
@@ -110,15 +147,27 @@ ipcMain.handle('dialog:select-directory', async () => {
   return null;
 });
 
+const FORBIDDEN_EXEC_EXTENSIONS = new Set([
+  '.exe', '.bat', '.cmd', '.com', '.scr', '.msi', '.ps1', '.vbs', '.vbe',
+  '.js', '.jse', '.wsf', '.wsh', '.pif', '.reg', '.dll', '.cpl'
+]);
+
 ipcMain.handle('shell:open-file', async (_event, filePath) => {
   if (filePath && typeof filePath === 'string') {
-    return await shell.openPath(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    if (FORBIDDEN_EXEC_EXTENSIONS.has(ext)) {
+      console.warn(`[Electron Core] Intento de ejecución bloqueado para archivo con extensión ${ext}`);
+      return false;
+    }
+    if (fs.existsSync(filePath)) {
+      return await shell.openPath(filePath);
+    }
   }
   return false;
 });
 
 ipcMain.handle('shell:show-item', async (_event, filePath) => {
-  if (filePath && typeof filePath === 'string') {
+  if (filePath && typeof filePath === 'string' && fs.existsSync(filePath)) {
     shell.showItemInFolder(filePath);
     return true;
   }
@@ -151,11 +200,29 @@ app.whenReady().then(async () => {
   }
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    if (serverInstance) {
-      serverInstance.close();
+function cleanupAndExit() {
+  if (typeof serverCleanupFn === 'function') {
+    try {
+      serverCleanupFn();
+    } catch (e) {
+      console.error('[Electron Core] Error en limpieza de procesos:', e);
     }
+  }
+  if (serverInstance) {
+    try {
+      serverInstance.close();
+    } catch {}
+  }
+}
+
+app.on('before-quit', () => {
+  cleanupAndExit();
+});
+
+app.on('window-all-closed', () => {
+  cleanupAndExit();
+  if (process.platform !== 'darwin') {
     app.quit();
   }
 });
+
